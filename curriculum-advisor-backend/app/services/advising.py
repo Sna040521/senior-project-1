@@ -150,7 +150,7 @@ def get_next_ethics_seminar(session_id: int, db: Session) -> Optional[dict]:
             WHERE a.session_id = :sid
               AND c.is_ethics_seminar = TRUE
               AND cc.course_code = :code
-              AND a.grade = 'S'
+              AND a.grade IN ('S', 'IP')
             LIMIT 1
         """), {"sid": session_id, "code": s["course_code"]}).scalar()
 
@@ -209,9 +209,21 @@ def build_recommendations(
     passed_codes = set()
     failed_codes = set()
     passed_course_code_ids = set()
+    in_progress_course_ids = set()
+    in_progress_course_code_ids = set()
 
     for row in attempts:
+        grade = row["grade"].strip().upper()
+
+        # --- IP handling ---
+        if grade == "IP":
+            in_progress_course_ids.add(int(row["course_id"]))
+            in_progress_course_code_ids.add(int(row["course_code_id"]))
+            continue
+
+        # --- Normal pass/fail handling ---
         ok = is_passing(row["grade"], row["required_grade"])
+
         if ok:
             passed_course_ids.add(int(row["course_id"]))
             passed_codes.add(row["course_code"])
@@ -220,15 +232,14 @@ def build_recommendations(
             failed_codes.add(row["course_code"])
 
     # earned credits = sum credits of unique passed courses
-    if passed_course_ids:
-        earned_row = db.execute(text("""
-            SELECT COALESCE(SUM(c.credits), 0) AS earned_credits
-            FROM courses c
-            WHERE c.course_id = ANY(:passed_ids)
-        """), {"passed_ids": list(passed_course_ids)}).mappings().first()
-        earned_credits = int(earned_row["earned_credits"])
-    else:
-        earned_credits = 0
+    earned_row = db.execute(text("""
+        SELECT COALESCE(SUM(a.credits_earned), 0) AS earned_credits
+        FROM session_course_attempts a
+        WHERE a.session_id = :sid
+            AND a.credits_earned > 0
+    """), {"sid": session_id}).mappings().first()
+
+    earned_credits = int(earned_row["earned_credits"])
     
     # --------------------------------------------------------
     # Load main category required credits (GE, FE)
@@ -254,7 +265,7 @@ def build_recommendations(
     category_credit_rows = db.execute(text("""
         SELECT 
             mc.name AS main_category,
-            SUM(c.credits) AS earned_credits
+            COALESCE(SUM(a.credits_earned), 0) AS earned_credits 
         FROM session_course_attempts a
         JOIN course_codes cc ON cc.course_code_id = a.course_code_id
         JOIN courses c ON c.course_id = cc.course_id
@@ -263,7 +274,7 @@ def build_recommendations(
         JOIN main_categories mc ON mc.main_category_id = sub.main_category_id
         WHERE a.session_id = :sid
           AND sub.curriculum_id = :cid
-          AND a.grade IS NOT NULL
+          AND a.credits_earned > 0
         GROUP BY mc.name
     """), {"sid": session_id, "cid": curriculum_id}).mappings().all()
 
@@ -472,7 +483,7 @@ def build_recommendations(
         }
 
         # determine blocking reason
-        if course_id in passed_course_ids:
+        if course_id in passed_course_ids or course_id in in_progress_course_ids:
             block_reason = "completed"
         elif earned_credits < int(c["min_credits_required"]):
             block_reason = "credit"
